@@ -31,7 +31,7 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk, Image
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
@@ -350,6 +350,19 @@ def parse_args():
         default=4,
         help=("The dimension of the LoRA update matrices."),
     )
+    parser.add_argument(
+        "--prefix",
+        type=str,
+        default=None,
+        help=("Wandb prefix"),
+    )
+
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help=("Wandb run name"),
+    )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -384,6 +397,12 @@ def main():
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
         import wandb
+        wandb.init(
+            entity="diffusion-evolution",
+            project="text2image-fine-tune",
+            group=args.prefix,
+            name=args.run_name,
+        )
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -538,20 +557,23 @@ def main():
             data_dir=args.train_data_dir,
         )
     else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
+        dataset = load_from_disk(
+            args.train_data_dir,
         )
+        # data_files = {}
+        # if args.train_data_dir is not None:
+        #     data_files["train"] = os.path.join(args.train_data_dir, "**")
+        # dataset = load_dataset(
+        #     "imagefolder",
+        #     data_files=data_files,
+        #     cache_dir=args.cache_dir,
+        # )
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
+    column_names = dataset.column_names
 
     # 6. Get the column names for input/target.
     dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
@@ -603,16 +625,19 @@ def main():
     )
 
     def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
+        if isinstance(examples[image_column][0], dict):
+            images = [Image().decode_example(image).convert("RGB") for image in examples[image_column]]
+        else:
+            images = [image.convert("RGB") for image in examples[image_column]]
         examples["pixel_values"] = [train_transforms(image) for image in images]
         examples["input_ids"] = tokenize_captions(examples)
         return examples
 
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+            dataset = dataset.shuffle(seed=args.seed).select(range(args.max_train_samples))
         # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
+        train_dataset = dataset.with_transform(preprocess_train)
 
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
