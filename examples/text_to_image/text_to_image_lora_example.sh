@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 export MODEL_NAME="CompVis/stable-diffusion-v1-4"
-export DATASET_NAME="/home/chet/diffusers/examples/text_to_image/pokemon_blip_evolution"
+export DATASET_NAME="/home/chet/diffusers/examples/pokemon_blip_evolution"
 
 accelerate launch --mixed_precision="fp16" train_text_to_image_lora.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
