@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2023 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +23,8 @@ from pathlib import Path
 
 import datasets
 import numpy as np
+import PIL
+import requests
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -39,7 +40,7 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel, DiffusionPipeline, StableDiffusionImg2ImgPipeline
 from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import LoRAAttnProcessor
 from diffusers.optimization import get_scheduler
@@ -132,6 +133,12 @@ def parse_args():
         type=str,
         default="text",
         help="The column of the dataset containing a caption or a list of captions.",
+    )
+    parser.add_argument(
+        "--val_image_url",
+        type=str,
+        default=None,
+        help="URL to the original image that you would like to edit (used during inference for debugging purposes).",
     )
     parser.add_argument(
         "--validation_prompt", type=str, default=None, help="A prompt that is sampled during training for inference."
@@ -380,6 +387,12 @@ DATASET_NAME_MAPPING = {
     "lambdalabs/pokemon-blip-captions": ("image", "text"),
 }
 
+def download_image(url):
+    image = PIL.Image.open(requests.get(url, stream=True).raw)
+    image = PIL.ImageOps.exif_transpose(image)
+    image = image.convert("RGB")
+    return image
+
 
 def main():
     args = parse_args()
@@ -623,7 +636,7 @@ def main():
             transforms.Normalize([0.5], [0.5]),
         ]
     )
-
+    
     def preprocess_train(examples):
         if isinstance(examples[image_column][0], dict):
             images = [Image().decode_example(image).convert("RGB") for image in examples[image_column]]
@@ -853,42 +866,69 @@ def main():
                     f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
                     f" {args.validation_prompt}."
                 )
-                # create pipeline
+                # create val pipelines
                 pipeline = DiffusionPipeline.from_pretrained(
                     args.pretrained_model_name_or_path,
                     unet=accelerator.unwrap_model(unet),
                     revision=args.revision,
                     torch_dtype=weight_dtype,
                 )
-                pipeline = pipeline.to(accelerator.device)
-                pipeline.set_progress_bar_config(disable=True)
-
-                # run inference
-                generator = torch.Generator(device=accelerator.device)
-                if args.seed is not None:
-                    generator = generator.manual_seed(args.seed)
-                images = []
-                for _ in range(args.num_validation_images):
-                    images.append(
-                        pipeline(args.validation_prompt, num_inference_steps=30, generator=generator).images[0]
+                val_pipelines = {'default': pipeline}
+                val_pipelines_kwargs = {'default': {}}
+                if args.val_image_url is not None:
+                    pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
+                        args.pretrained_model_name_or_path,
+                        text_encoder=accelerator.unwrap_model(text_encoder),
+                        unet=accelerator.unwrap_model(unet),
+                        vae=accelerator.unwrap_model(vae),
+                        revision=args.revision,
+                        torch_dtype=weight_dtype,
+                        safety_checker = None,
+                        requires_safety_checker = False
                     )
+                    val_pipelines['sdedit'] = pipeline
+                    val_pipelines_kwargs['sdedit'] = {
+                        'image': download_image(args.val_image_url),
+                        'strength': 0.95,
+                    }
+                for pipeline_key, pipeline in val_pipelines.items():
+                    pipeline = pipeline.to(accelerator.device)
+                    pipeline.set_progress_bar_config(disable=True)
 
-                for tracker in accelerator.trackers:
-                    if tracker.name == "tensorboard":
-                        np_images = np.stack([np.asarray(img) for img in images])
-                        tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
-                    if tracker.name == "wandb":
-                        tracker.log(
-                            {
-                                "validation": [
-                                    wandb.Image(image, caption=f"{i}: {args.validation_prompt}")
-                                    for i, image in enumerate(images)
-                                ]
-                            }
-                        )
+                    generator = torch.Generator(device=accelerator.device)
+                    if args.seed is not None:
+                        generator = generator.manual_seed(args.seed)
+                    images = []
+                    with torch.autocast(
+                        str(accelerator.device).replace(":0", ""), enabled=accelerator.mixed_precision == "fp16"
+                    ):
+                        for _ in range(args.num_validation_images):
+                            images.append(
+                                pipeline(
+                                    args.validation_prompt,
+                                    num_inference_steps=50,
+                                    generator=generator,
+                                    **val_pipelines_kwargs[pipeline_key],
+                                ).images[0]
+                            )
 
-                del pipeline
-                torch.cuda.empty_cache()
+                    for tracker in accelerator.trackers:
+                        images_key = f"{pipeline_key}_validation"
+                        if tracker.name == "tensorboard":
+                            np_images = np.stack([np.asarray(img) for img in images])
+                            tracker.writer.add_images(images_key, np_images, epoch, dataformats="NHWC")
+                        if tracker.name == "wandb":
+                            tracker.log(
+                                {
+                                    images_key: [
+                                        wandb.Image(image, caption=f"{i}: {args.validation_prompt}")
+                                        for i, image in enumerate(images)
+                                    ]
+                                }
+                            )
+
+                    del pipeline
+                    torch.cuda.empty_cache()
 
     # Save the lora layers
     accelerator.wait_for_everyone()
@@ -913,38 +953,71 @@ def main():
 
     # Final inference
     # Load previous pipeline
+    # create test pipelines
     pipeline = DiffusionPipeline.from_pretrained(
-        args.pretrained_model_name_or_path, revision=args.revision, torch_dtype=weight_dtype
+        args.pretrained_model_name_or_path,
+        unet=accelerator.unwrap_model(unet),
+        revision=args.revision,
+        torch_dtype=weight_dtype,
     )
-    pipeline = pipeline.to(accelerator.device)
+    test_pipelines = {'default': pipeline}
+    test_pipelines_kwargs = {'default': {}}
+    if args.val_image_url is not None:
+        pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(
+            args.pretrained_model_name_or_path,
+            text_encoder=accelerator.unwrap_model(text_encoder),
+            unet=accelerator.unwrap_model(unet),
+            vae=accelerator.unwrap_model(vae),
+            revision=args.revision,
+            torch_dtype=weight_dtype,
+            safety_checker = None,
+            requires_safety_checker = False
+        )
+        test_pipelines['sdedit'] = pipeline
+        test_pipelines_kwargs['sdedit'] = {
+            'image': download_image(args.val_image_url),
+            'strength': 0.95,
+        }
+    for pipeline_key, pipeline in test_pipelines.items():
+        pipeline = pipeline.to(accelerator.device)
 
-    # load attention processors
-    pipeline.unet.load_attn_procs(args.output_dir)
+        # load attention processors
+        pipeline.unet.load_attn_procs(args.output_dir)
 
-    # run inference
-    generator = torch.Generator(device=accelerator.device)
-    if args.seed is not None:
-        generator = generator.manual_seed(args.seed)
-    images = []
-    for _ in range(args.num_validation_images):
-        images.append(pipeline(args.validation_prompt, num_inference_steps=30, generator=generator).images[0])
+        # run inference
+        generator = torch.Generator(device=accelerator.device)
+        if args.seed is not None:
+            generator = generator.manual_seed(args.seed)
+        images = []
+        with torch.autocast(
+            str(accelerator.device).replace(":0", ""), enabled=accelerator.mixed_precision == "fp16"
+        ):
+            for _ in range(args.num_validation_images):
+                images.append(
+                    pipeline(
+                        args.validation_prompt,
+                        num_inference_steps=50,
+                        generator=generator,
+                        **test_pipelines_kwargs[pipeline_key],
+                    ).images[0]
+                )
 
-    if accelerator.is_main_process:
-        for tracker in accelerator.trackers:
-            if len(images) != 0:
-                if tracker.name == "tensorboard":
-                    np_images = np.stack([np.asarray(img) for img in images])
-                    tracker.writer.add_images("test", np_images, epoch, dataformats="NHWC")
-                if tracker.name == "wandb":
-                    tracker.log(
-                        {
-                            "test": [
-                                wandb.Image(image, caption=f"{i}: {args.validation_prompt}")
-                                for i, image in enumerate(images)
-                            ]
-                        }
-                    )
-
+        if accelerator.is_main_process:
+            for tracker in accelerator.trackers:
+                if len(images) != 0:
+                    images_key = f"{pipeline_key}_test"
+                    if tracker.name == "tensorboard":
+                        np_images = np.stack([np.asarray(img) for img in images])
+                        tracker.writer.add_images(images_key, np_images, epoch, dataformats="NHWC")
+                    if tracker.name == "wandb":
+                        tracker.log(
+                            {
+                                "test": [
+                                    wandb.Image(images_key, caption=f"{i}: {args.validation_prompt}")
+                                    for i, image in enumerate(images)
+                                ]
+                            }
+                        )
     accelerator.end_training()
 
 

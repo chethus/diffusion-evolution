@@ -59,7 +59,7 @@ logger = get_logger(__name__, log_level="INFO")
 DATASET_NAME_MAPPING = {
     "fusing/instructpix2pix-1000-samples": ("input_image", "edit_prompt", "edited_image"),
 }
-WANDB_TABLE_COL_NAMES = ["original_image", "edited_image", "edit_prompt"]
+WANDB_TABLE_COL_NAMES = ["original_image", "edited_image"]
 
 
 def parse_args():
@@ -964,12 +964,15 @@ def main():
 
                 for tracker in accelerator.trackers:
                     if tracker.name == "wandb":
-                        wandb_table = wandb.Table(columns=WANDB_TABLE_COL_NAMES)
-                        for edited_image in edited_images:
-                            wandb_table.add_data(
-                                wandb.Image(original_image), wandb.Image(edited_image), args.validation_prompt
-                            )
-                        tracker.log({"validation": wandb_table})
+                        tracker.log(
+                            {
+                                "validation": [
+                                    wandb.Image(image, caption=f"{i}: {args.validation_prompt}")
+                                    for i, image in enumerate(edited_images)
+                                ]
+                            }
+                        )
+
                 if args.use_ema:
                     # Switch back to the original UNet parameters.
                     ema_unet.restore(unet.parameters())
